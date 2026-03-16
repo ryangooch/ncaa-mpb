@@ -1,0 +1,13 @@
+[project]
+name = "ncaab-mpb"
+version = "0.1.0"
+description = "NCAA basketball Monte Carlo bracket simulator and Torvik game stats scraper"
+requires-python = ">=3.14"
+dependencies = [
+    "beautifulsoup4>=4.14.3",
+    "lxml",
+    "numpy>=2.4.3",
+    "rich",
+    "selenium",
+    "playwright",
+]

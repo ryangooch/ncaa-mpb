@@ -1,0 +1,857 @@
+#!/usr/bin/env python3
+"""
+What-If Bracket Simulator — Monte Carlo NCAA tournament simulation.
+
+Lets users pick a focus stat from the Torvik game stats DB that shifts
+win probabilities, then simulates the bracket thousands of times to see
+how outcomes change.
+
+Usage:
+    uv run python whatif.py [--bracket PATH] [--db PATH] [--sims N] [--seed N]
+"""
+
+import argparse
+import difflib
+import math
+import sqlite3
+import statistics
+from collections import defaultdict
+from dataclasses import dataclass
+from urllib.parse import unquote
+
+import numpy as np
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
+from rich.prompt import Prompt
+from rich.table import Table
+
+from bracket import load_bracket
+
+# ---------------------------------------------------------------------------
+# Name mapping: Massey → Torvik
+# ---------------------------------------------------------------------------
+
+# Hardcoded mapping for teams whose names differ between sources.
+# Update this dict when the Massey CSV or Torvik DB team names change.
+# Set a value to None to explicitly mark a team as having no Torvik match.
+MASSEY_TO_TORVIK = {
+    "St Mary's CA": "Saint Mary's",
+    "NC State": "N.C. State",
+    "Miami FL": "Miami FL",
+    "Iowa St": "Iowa St.",
+    "Michigan St": "Michigan St.",
+    "Ohio St": "Ohio St.",
+    "Utah St": "Utah St.",
+    "McNeese St": "McNeese St.",
+    "Kennesaw St": "Kennesaw St.",
+    "St. John's": "St. John%27s",
+    "McNeese": "McNeese St.",
+    "N Dakota St": "North Dakota St.",
+    "Iowa State": "Iowa St.",
+    "Long Island": "LIU",
+}
+
+
+def _build_name_map(massey_names: list[str], torvik_names: list[str],
+                    console: Console | None = None) -> dict:
+    """Build Massey → Torvik name mapping using hardcoded + exact matching.
+
+    Fuzzy matching uses a high cutoff (0.85) to avoid false positives like
+    Drake→Duke. Unmatched teams are reported so the user can add them to
+    MASSEY_TO_TORVIK.
+    """
+    mapping = {}
+    torvik_decoded = {unquote(t): t for t in torvik_names}
+    decoded_list = list(torvik_decoded.keys())
+
+    for mname in massey_names:
+        ms = mname.strip()
+
+        # 1. Hardcoded mapping
+        if ms in MASSEY_TO_TORVIK:
+            candidate = MASSEY_TO_TORVIK[ms]
+            if candidate is None:
+                mapping[ms] = None
+                continue
+            if candidate in torvik_decoded:
+                mapping[ms] = torvik_decoded[candidate]
+                continue
+            # Candidate not found in DB — try raw form too
+            if candidate in torvik_names:
+                mapping[ms] = candidate
+                continue
+
+        # 2. Exact match (decoded Torvik name)
+        if ms in torvik_decoded:
+            mapping[ms] = torvik_decoded[ms]
+            continue
+
+        # 3. Fuzzy match with high cutoff to avoid false positives
+        matches = difflib.get_close_matches(ms, decoded_list, n=1, cutoff=0.85)
+        if matches:
+            matched_decoded = matches[0]
+            mapping[ms] = torvik_decoded[matched_decoded]
+            if console:
+                console.print(f"  [dim]Fuzzy: {ms} → {matched_decoded}[/dim]")
+            continue
+
+        mapping[ms] = None
+
+    return mapping
+
+
+# ---------------------------------------------------------------------------
+# Seed-based priors for unmatched teams
+# ---------------------------------------------------------------------------
+
+# Typical adj_margin by seed (approximate historical averages)
+SEED_ADJ_MARGIN = {
+    1: 25.0, 2: 20.0, 3: 17.0, 4: 14.0,
+    5: 12.0, 6: 10.0, 7: 8.5, 8: 7.0,
+    9: 5.5, 10: 4.5, 11: 3.5, 12: 2.5,
+    13: 1.0, 14: -1.0, 15: -3.0, 16: -6.0,
+}
+
+
+def _seed_prior_stats(team_name: str, seed: int) -> "TeamStats":
+    """Create a TeamStats with seed-based priors for unmatched teams."""
+    margin = SEED_ADJ_MARGIN.get(seed, 0.0)
+    return TeamStats(
+        team=team_name,
+        seed=seed,
+        adj_margin=margin,
+        eff_margin=margin * 0.8,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Team stats from Torvik DB
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TeamStats:
+    """Season averages and derived stats for a single team."""
+    team: str
+    seed: int = 0
+    region: int = -1
+    has_data: bool = False
+    # Season averages
+    avg_adj_o: float = 0.0
+    avg_adj_d: float = 0.0
+    avg_off_eff: float = 0.0
+    avg_def_eff: float = 0.0
+    avg_off_to_pct: float = 0.0
+    avg_def_to_pct: float = 0.0
+    avg_off_or_pct: float = 0.0
+    avg_def_or_pct: float = 0.0
+    avg_off_ftr: float = 0.0
+    avg_def_ftr: float = 0.0
+    avg_wab: float = 0.0
+    # Derived
+    adj_margin: float = 0.0
+    eff_margin: float = 0.0
+    three_pt_pct: float = 0.0
+    three_pt_variance: float = 0.0
+    late_season_trend: float = 0.0
+    turnover_diff: float = 0.0
+    rebound_diff: float = 0.0
+    ftr_diff: float = 0.0
+    wab: float = 0.0
+
+
+def load_team_stats(db_path: str, torvik_name: str) -> TeamStats | None:
+    """Load and compute stats for a single team from the Torvik DB."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+
+    rows = conn.execute(
+        "SELECT * FROM games WHERE team = ? ORDER BY id", (torvik_name,)
+    ).fetchall()
+
+    if not rows:
+        conn.close()
+        return None
+
+    ts = TeamStats(team=torvik_name, has_data=True)
+
+    n = len(rows)
+    ts.avg_adj_o = sum(r["adj_o"] or 0 for r in rows) / n
+    ts.avg_adj_d = sum(r["adj_d"] or 0 for r in rows) / n
+    ts.avg_off_eff = sum(r["off_eff"] or 0 for r in rows) / n
+    ts.avg_def_eff = sum(r["def_eff"] or 0 for r in rows) / n
+    ts.avg_off_to_pct = sum(r["off_to_pct"] or 0 for r in rows) / n
+    ts.avg_def_to_pct = sum(r["def_to_pct"] or 0 for r in rows) / n
+    ts.avg_off_or_pct = sum(r["off_or_pct"] or 0 for r in rows) / n
+    ts.avg_def_or_pct = sum(r["def_or_pct"] or 0 for r in rows) / n
+    ts.avg_off_ftr = sum(r["off_ftr"] or 0 for r in rows) / n
+    ts.avg_def_ftr = sum(r["def_ftr"] or 0 for r in rows) / n
+    ts.avg_wab = sum(r["wab"] or 0 for r in rows) / n
+
+    ts.adj_margin = ts.avg_adj_o - ts.avg_adj_d
+    ts.eff_margin = ts.avg_off_eff - ts.avg_def_eff
+    ts.turnover_diff = ts.avg_def_to_pct - ts.avg_off_to_pct
+    ts.rebound_diff = ts.avg_off_or_pct - ts.avg_def_or_pct
+    ts.ftr_diff = ts.avg_off_ftr - ts.avg_def_ftr
+    ts.wab = ts.avg_wab
+
+    game_3p_pcts = []
+    for r in rows:
+        att = r["off_3pa"]
+        made = r["off_3pm"]
+        if att and att > 0:
+            game_3p_pcts.append(made / att)
+    if game_3p_pcts:
+        ts.three_pt_pct = statistics.mean(game_3p_pcts)
+        ts.three_pt_variance = statistics.stdev(game_3p_pcts) if len(game_3p_pcts) > 1 else 0.0
+
+    full_margins = [(r["off_eff"] or 0) - (r["def_eff"] or 0) for r in rows]
+    full_avg = sum(full_margins) / len(full_margins) if full_margins else 0
+    last_10 = full_margins[-10:]
+    last_10_avg = sum(last_10) / len(last_10) if last_10 else 0
+    ts.late_season_trend = last_10_avg - full_avg
+
+    conn.close()
+    return ts
+
+
+# ---------------------------------------------------------------------------
+# Focus stats definition
+# ---------------------------------------------------------------------------
+
+FOCUS_STATS = {
+    "1": ("adj_margin", "Adjusted Efficiency Margin (AdjO - AdjD)"),
+    "2": ("eff_margin", "Raw Efficiency Margin"),
+    "3": ("three_pt_pct", "Three-Point Shooting %"),
+    "4": ("three_pt_variance", "Three-Point Variance (get hot factor)"),
+    "5": ("late_season_trend", "Late-Season Trend (peaking teams)"),
+    "6": ("turnover_diff", "Turnover Differential (force TOs - commit TOs)"),
+    "7": ("rebound_diff", "Rebounding Differential (OFF reb% - DEF reb%)"),
+    "8": ("ftr_diff", "Free Throw Rate Differential"),
+    "9": ("wab", "Wins Above Bubble"),
+}
+
+
+# ---------------------------------------------------------------------------
+# Win probability model
+# ---------------------------------------------------------------------------
+
+# Historical seed-vs-seed win rates for round 1
+SEED_WIN_RATES = {
+    (1, 16): 0.985, (2, 15): 0.935, (3, 14): 0.855, (4, 13): 0.790,
+    (5, 12): 0.645, (6, 11): 0.625, (7, 10): 0.605, (8, 9): 0.510,
+}
+
+
+def _logistic(x: float) -> float:
+    """Logistic function mapping efficiency diff to win probability."""
+    return 1.0 / (1.0 + math.exp(-0.15 * x))
+
+
+def win_probability(
+    team_a: TeamStats,
+    team_b: TeamStats,
+    round_num: int,
+    focus_stat: str | None,
+    z_scores: dict[str, dict[str, float]],
+    is_3pt_focus: bool = False,
+) -> float:
+    """Compute win probability for team_a vs team_b.
+
+    round_num: 1=R64, 2=R32, 3=S16, 4=E8, 5=F4, 6=Championship
+    """
+    # Round 1 between standard seed matchups: use historical rates
+    if round_num == 1 and team_a.seed > 0 and team_b.seed > 0:
+        s_lo = min(team_a.seed, team_b.seed)
+        s_hi = max(team_a.seed, team_b.seed)
+        if (s_lo, s_hi) in SEED_WIN_RATES:
+            base_p = SEED_WIN_RATES[(s_lo, s_hi)]
+            if team_a.seed > team_b.seed:
+                base_p = 1.0 - base_p
+            # Blend with logistic if both have real data (70% historical, 30% data)
+            if team_a.has_data and team_b.has_data:
+                data_p = _logistic(team_a.adj_margin - team_b.adj_margin)
+                base_p = 0.7 * base_p + 0.3 * data_p
+        else:
+            base_p = _logistic(team_a.adj_margin - team_b.adj_margin)
+    else:
+        base_p = _logistic(team_a.adj_margin - team_b.adj_margin)
+
+    # Focus stat shift
+    if focus_stat:
+        z_a = z_scores.get(team_a.team, {}).get(focus_stat, 0.0)
+        z_b = z_scores.get(team_b.team, {}).get(focus_stat, 0.0)
+        shift = 0.05 * (z_a - z_b)
+        shift = max(-0.15, min(0.15, shift))
+
+        # 3-point variance special: high variance slightly boosts underdog
+        if is_3pt_focus and team_a.seed > team_b.seed:
+            var_boost = 0.02 * z_a
+            shift += max(0, min(0.05, var_boost))
+        elif is_3pt_focus and team_b.seed > team_a.seed:
+            var_boost = 0.02 * z_b
+            shift -= max(0, min(0.05, var_boost))
+
+        base_p += shift
+
+    return max(0.02, min(0.98, base_p))
+
+
+def compute_z_scores(all_stats: dict[str, TeamStats]) -> dict[str, dict[str, float]]:
+    """Compute z-scores for each focus stat across all teams."""
+    stat_names = [s[0] for s in FOCUS_STATS.values()]
+    z_scores: dict[str, dict[str, float]] = {}
+
+    for stat_name in stat_names:
+        values = [getattr(ts, stat_name, 0.0) for ts in all_stats.values()]
+        if not values:
+            continue
+        mean = sum(values) / len(values)
+        std = statistics.stdev(values) if len(values) > 1 else 1.0
+        if std == 0:
+            std = 1.0
+        for ts in all_stats.values():
+            z_scores.setdefault(ts.team, {})[stat_name] = (
+                (getattr(ts, stat_name, 0.0) - mean) / std
+            )
+
+    return z_scores
+
+
+# ---------------------------------------------------------------------------
+# Monte Carlo engine
+# ---------------------------------------------------------------------------
+
+class _nullcontext:
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        pass
+
+
+def simulate_bracket(
+    regions: dict,
+    first_four: list,
+    team_lookup: dict[str, TeamStats],
+    focus_stat: str | None,
+    z_scores: dict[str, dict[str, float]],
+    n_sims: int = 10_000,
+    rng_seed: int | None = None,
+    console: Console | None = None,
+) -> dict:
+    """Run Monte Carlo bracket simulation.
+
+    team_lookup maps whitespace-stripped Massey names to TeamStats objects.
+    """
+    rng = np.random.default_rng(rng_seed)
+    is_3pt = focus_stat == "three_pt_variance"
+
+    advancement: dict[str, list[int]] = defaultdict(lambda: [0] * 7)
+    champion_counts: dict[str, int] = defaultdict(int)
+
+    def get_stats(team_name: str) -> TeamStats:
+        name = team_name.strip()
+        if name in team_lookup:
+            return team_lookup[name]
+        return TeamStats(team=name)
+
+    def sim_game(a_name: str, b_name: str, round_num: int) -> str:
+        stats_a = get_stats(a_name)
+        stats_b = get_stats(b_name)
+        p = win_probability(stats_a, stats_b, round_num, focus_stat, z_scores, is_3pt)
+        return a_name if rng.random() < p else b_name
+
+    progress = None
+    if console:
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            console=console,
+        )
+
+    ctx = progress if progress else _nullcontext()
+    with ctx:
+        task_id = progress.add_task("Simulating brackets...", total=n_sims) if progress else None
+
+        for _ in range(n_sims):
+            # Resolve First Four
+            ff_winners = []
+            for t1, t2, seed in first_four:
+                winner = sim_game(t1, t2, 1)
+                ff_winners.append(winner)
+
+            ff_idx = 0
+            region_winners = []
+            for r_idx in range(4):
+                region = regions[r_idx]
+                matchups = []
+                for s in [1, 16, 8, 9, 5, 12, 4, 13, 6, 11, 3, 14, 7, 10, 2, 15]:
+                    team = region.get(s, "TBD")
+                    if team == "Play-in":
+                        if ff_idx < len(ff_winners):
+                            team = ff_winners[ff_idx]
+                            ff_idx += 1
+                    matchups.append(team)
+
+                # R64 (8 games)
+                r64_w = []
+                for i in range(0, 16, 2):
+                    w = sim_game(matchups[i], matchups[i + 1], 1)
+                    advancement[w][0] += 1
+                    r64_w.append(w)
+
+                # R32 (4 games)
+                r32_w = []
+                for i in range(0, 8, 2):
+                    w = sim_game(r64_w[i], r64_w[i + 1], 2)
+                    advancement[w][1] += 1
+                    r32_w.append(w)
+
+                # Sweet 16 (2 games)
+                s16_w = []
+                for i in range(0, 4, 2):
+                    w = sim_game(r32_w[i], r32_w[i + 1], 3)
+                    advancement[w][2] += 1
+                    s16_w.append(w)
+
+                # Elite 8
+                e8_w = sim_game(s16_w[0], s16_w[1], 4)
+                advancement[e8_w][3] += 1
+                region_winners.append(e8_w)
+
+            # Final Four
+            ff1 = sim_game(region_winners[0], region_winners[1], 5)
+            advancement[ff1][4] += 1
+            ff2 = sim_game(region_winners[2], region_winners[3], 5)
+            advancement[ff2][4] += 1
+
+            # Championship
+            champ = sim_game(ff1, ff2, 6)
+            advancement[champ][5] += 1
+            champion_counts[champ] += 1
+
+            if progress and task_id is not None:
+                progress.update(task_id, advance=1)
+
+    return {
+        "advancement": dict(advancement),
+        "champion_counts": dict(champion_counts),
+        "n_sims": n_sims,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
+
+REGION_NAMES = ["SOUTH", "WEST", "EAST", "MIDWEST"]
+MATCHUP_ORDER = [1, 16, 8, 9, 5, 12, 4, 13, 6, 11, 3, 14, 7, 10, 2, 15]
+
+
+def _pct_style(pct: float) -> str:
+    if pct >= 75:
+        return "[green]"
+    elif pct >= 50:
+        return "[yellow]"
+    else:
+        return "[red]"
+
+
+def _s(name: str) -> str:
+    """Strip whitespace from team name for display."""
+    return name.strip()
+
+
+def display_bracket(
+    results: dict,
+    regions: dict,
+    first_four: list,
+    console: Console,
+):
+    """Display bracket-style view showing most likely winners per matchup."""
+    n = results["n_sims"]
+    adv = results["advancement"]
+
+    console.print("\n[bold underline]BRACKET — Most Likely Outcomes[/bold underline]\n")
+
+    for r_idx in range(4):
+        region = regions[r_idx]
+        console.print(f"[bold cyan]── {REGION_NAMES[r_idx]} ──[/bold cyan]")
+
+        # Build matchup pairs in bracket order
+        teams_in_order = []
+        for s in MATCHUP_ORDER:
+            team = region.get(s, "TBD")
+            teams_in_order.append((s, team))
+
+        # R64 matchups
+        r64_pairs = []
+        for i in range(0, 16, 2):
+            s1, t1 = teams_in_order[i]
+            s2, t2 = teams_in_order[i + 1]
+            c1 = adv.get(t1, [0] * 7)[0]
+            c2 = adv.get(t2, [0] * 7)[0]
+            p1 = 100 * c1 / n if n > 0 else 0
+            p2 = 100 * c2 / n if n > 0 else 0
+            winner = t1 if c1 >= c2 else t2
+            w_seed = s1 if c1 >= c2 else s2
+            w_pct = max(p1, p2)
+            r64_pairs.append((winner, w_seed, w_pct))
+
+            style = _pct_style(w_pct)
+            console.print(
+                f"  ({s1:>2}) {_s(t1):18s} vs ({s2:>2}) {_s(t2):18s}"
+                f"  → {style}{_s(winner)} ({w_pct:.0f}%)[/]"
+            )
+
+        # R32
+        r32_pairs = []
+        for i in range(0, 8, 2):
+            w1, ws1, _ = r64_pairs[i]
+            w2, ws2, _ = r64_pairs[i + 1]
+            c1 = adv.get(w1, [0] * 7)[1]
+            c2 = adv.get(w2, [0] * 7)[1]
+            winner = w1 if c1 >= c2 else w2
+            w_seed = ws1 if c1 >= c2 else ws2
+            w_pct = 100 * max(c1, c2) / n if n > 0 else 0
+            r32_pairs.append((winner, w_seed, w_pct))
+
+        console.print(f"  [dim]Round of 32:[/dim]")
+        for w, ws, wp in r32_pairs:
+            style = _pct_style(wp)
+            console.print(f"    {style}({ws:>2}) {_s(w)} ({wp:.0f}%)[/]")
+
+        # S16
+        s16_pairs = []
+        for i in range(0, 4, 2):
+            w1, ws1, _ = r32_pairs[i]
+            w2, ws2, _ = r32_pairs[i + 1]
+            c1 = adv.get(w1, [0] * 7)[2]
+            c2 = adv.get(w2, [0] * 7)[2]
+            winner = w1 if c1 >= c2 else w2
+            w_seed = ws1 if c1 >= c2 else ws2
+            w_pct = 100 * max(c1, c2) / n if n > 0 else 0
+            s16_pairs.append((winner, w_seed, w_pct))
+
+        console.print(f"  [dim]Sweet 16:[/dim]")
+        for w, ws, wp in s16_pairs:
+            style = _pct_style(wp)
+            console.print(f"    {style}({ws:>2}) {_s(w)} ({wp:.0f}%)[/]")
+
+        # E8
+        w1, ws1, _ = s16_pairs[0]
+        w2, ws2, _ = s16_pairs[1]
+        c1 = adv.get(w1, [0] * 7)[3]
+        c2 = adv.get(w2, [0] * 7)[3]
+        winner = w1 if c1 >= c2 else w2
+        w_seed = ws1 if c1 >= c2 else ws2
+        w_pct = 100 * max(c1, c2) / n if n > 0 else 0
+        style = _pct_style(w_pct)
+        console.print(f"  [dim]Elite 8 → [/dim]{style}({w_seed:>2}) {_s(winner)} ({w_pct:.0f}%)[/]")
+        console.print()
+
+
+def display_results(
+    results: dict,
+    regions: dict,
+    first_four: list,
+    focus_stat: str | None,
+    focus_label: str,
+    baseline_results: dict | None,
+    console: Console,
+):
+    """Display full simulation results."""
+    n = results["n_sims"]
+    adv = results["advancement"]
+    champs = results["champion_counts"]
+
+    # Bracket view first
+    display_bracket(results, regions, first_four, console)
+
+    # Region tables with all teams
+    ff_display_idx = 0
+    for r_idx in range(4):
+        region = regions[r_idx]
+        table = Table(
+            title=f"[bold]{REGION_NAMES[r_idx]} Region[/bold]",
+            show_header=True,
+            header_style="bold cyan",
+        )
+        table.add_column("Seed", justify="right", width=4)
+        table.add_column("Team", width=20)
+        table.add_column("R64 %", justify="right", width=7)
+        table.add_column("R32 %", justify="right", width=7)
+        table.add_column("S16 %", justify="right", width=7)
+        table.add_column("E8 %", justify="right", width=7)
+
+        for seed in MATCHUP_ORDER:
+            team = region.get(seed, "TBD")
+            if team == "Play-in":
+                # Show play-in teams — consume next matching first-four pair
+                if ff_display_idx < len(first_four):
+                    t1, t2, ff_seed = first_four[ff_display_idx]
+                    ff_display_idx += 1
+                    for ff_team in (t1, t2):
+                        counts = adv.get(ff_team, [0] * 7)
+                        pcts = [100 * c / n for c in counts[:4]]
+                        row = [f"{ff_seed}*", _s(ff_team)]
+                        for p in pcts:
+                            row.append(f"{_pct_style(p)}{p:5.1f}%[/]")
+                        table.add_row(*row)
+                continue
+            counts = adv.get(team, [0] * 7)
+            pcts = [100 * c / n for c in counts[:4]]
+            row = [str(seed), _s(team)]
+            for p in pcts:
+                row.append(f"{_pct_style(p)}{p:5.1f}%[/]")
+            table.add_row(*row)
+
+        console.print(table)
+        console.print()
+
+    # Final Four / Championship odds
+    ff_table = Table(
+        title="[bold]Final Four & Championship Odds[/bold]",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    ff_table.add_column("Team", width=20)
+    ff_table.add_column("Final Four %", justify="right", width=12)
+    ff_table.add_column("Finals %", justify="right", width=12)
+    ff_table.add_column("Champion %", justify="right", width=12)
+
+    sorted_teams = sorted(champs.items(), key=lambda x: x[1], reverse=True)
+    for team, count in sorted_teams[:16]:
+        team_counts = adv.get(team, [0] * 7)
+        f4_pct = 100 * team_counts[4] / n
+        final_pct = 100 * team_counts[5] / n
+        champ_pct = 100 * count / n
+        row = [_s(team)]
+        for p in [f4_pct, final_pct, champ_pct]:
+            row.append(f"{_pct_style(p)}{p:5.1f}%[/]")
+        ff_table.add_row(*row)
+
+    console.print(ff_table)
+    console.print()
+
+    # Cinderella watch
+    cinderellas = []
+    for team, counts in adv.items():
+        seed = _find_seed(team, regions, first_four)
+        if seed is not None and seed >= 10:
+            r32_pct = 100 * counts[1] / n
+            s16_pct = 100 * counts[2] / n
+            if r32_pct > 5 or s16_pct > 1:
+                cinderellas.append((_s(team), seed, r32_pct, s16_pct))
+
+    if cinderellas:
+        cind_table = Table(
+            title="[bold]Cinderella Watch (Seed >= 10)[/bold]",
+            show_header=True,
+            header_style="bold yellow",
+        )
+        cind_table.add_column("Seed", justify="right", width=4)
+        cind_table.add_column("Team", width=20)
+        cind_table.add_column("R32 %", justify="right", width=8)
+        cind_table.add_column("S16 %", justify="right", width=8)
+
+        cinderellas.sort(key=lambda x: x[3], reverse=True)
+        for team, seed, r32_p, s16_p in cinderellas:
+            cind_table.add_row(str(seed), team, f"{r32_p:5.1f}%", f"{s16_p:5.1f}%")
+        console.print(cind_table)
+        console.print()
+
+    # Impact summary
+    if baseline_results and focus_stat:
+        _display_impact(results, baseline_results, focus_label, console)
+
+
+def _find_seed(team: str, regions: dict, first_four: list) -> int | None:
+    """Find a team's seed from regions or first four."""
+    for r_idx in range(4):
+        for s, t in regions[r_idx].items():
+            if t == team:
+                return s
+    for t1, t2, seed in first_four:
+        if t1 == team or t2 == team:
+            return seed
+    return None
+
+
+def _display_impact(results, baseline_results, focus_label, console):
+    """Show how the focus stat shifted championship odds vs baseline."""
+    n = results["n_sims"]
+    base_n = baseline_results["n_sims"]
+    champs = results["champion_counts"]
+    base_champs = baseline_results["champion_counts"]
+
+    impact_table = Table(
+        title=f"[bold]Impact of Focus: {focus_label}[/bold]",
+        show_header=True,
+        header_style="bold blue",
+    )
+    impact_table.add_column("Team", width=20)
+    impact_table.add_column("Baseline %", justify="right", width=12)
+    impact_table.add_column("Focus %", justify="right", width=10)
+    impact_table.add_column("Shift", justify="right", width=8)
+
+    all_teams = set(list(champs.keys()) + list(base_champs.keys()))
+    shifts = []
+    for team in all_teams:
+        base_pct = 100 * base_champs.get(team, 0) / base_n
+        focus_pct = 100 * champs.get(team, 0) / n
+        shifts.append((_s(team), base_pct, focus_pct, focus_pct - base_pct))
+
+    shifts.sort(key=lambda x: abs(x[3]), reverse=True)
+    for team, base_pct, focus_pct, delta in shifts[:10]:
+        sign = "+" if delta > 0 else ""
+        color = "[green]" if delta > 0 else "[red]"
+        impact_table.add_row(
+            team, f"{base_pct:5.1f}%", f"{focus_pct:5.1f}%",
+            f"{color}{sign}{delta:4.1f}%[/]",
+        )
+    console.print(impact_table)
+    console.print()
+
+
+# ---------------------------------------------------------------------------
+# Main interactive loop
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="What-If Bracket Simulator")
+    parser.add_argument("--bracket", default="bracket.csv", help="Committee bracket CSV path")
+    parser.add_argument("--db", default="torvik_game_stats.db", help="Torvik game stats DB path")
+    parser.add_argument("--sims", type=int, default=10_000, help="Number of simulations")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    args = parser.parse_args()
+
+    console = Console()
+    console.print("[bold]Loading bracket data...[/bold]")
+
+    # Load bracket from committee bracket CSV
+    regions, first_four = load_bracket(args.bracket)
+
+    # Collect all bracket team names
+    bracket_names = []
+    for r_idx in range(4):
+        for seed, team in regions[r_idx].items():
+            if team != "Play-in":
+                bracket_names.append(team)
+    for t1, t2, _ in first_four:
+        bracket_names.extend([t1, t2])
+
+    # Get Torvik team names from DB
+    conn = sqlite3.connect(args.db)
+    torvik_names = [
+        r[0] for r in conn.execute("SELECT DISTINCT team FROM games ORDER BY team").fetchall()
+    ]
+    conn.close()
+
+    # Build name mapping (bracket CSV names → Torvik DB names)
+    name_map = _build_name_map(bracket_names, torvik_names, console)
+
+    matched = sum(1 for v in name_map.values() if v is not None)
+    total = len(name_map)
+    console.print(f"Matched [green]{matched}[/green]/{total} teams between bracket and Torvik DB")
+
+    unmatched = [k for k, v in name_map.items() if v is None]
+    if unmatched:
+        console.print(f"[yellow]Unmatched ({len(unmatched)}):[/yellow] {', '.join(unmatched)}")
+        console.print("[dim]Add missing mappings to MASSEY_TO_TORVIK in whatif.py[/dim]")
+
+    # Load team stats from DB
+    console.print("[bold]Loading team stats from Torvik DB...[/bold]")
+    all_stats: dict[str, TeamStats] = {}
+    for torvik_name in torvik_names:
+        ts = load_team_stats(args.db, torvik_name)
+        if ts:
+            all_stats[torvik_name] = ts
+
+    # Build team_lookup: bracket name → TeamStats
+    # For matched teams: use real DB stats
+    # For unmatched teams: use seed-based priors
+    team_lookup: dict[str, TeamStats] = {}
+    for r_idx in range(4):
+        for seed, team in regions[r_idx].items():
+            ms = team.strip()
+            if team == "Play-in":
+                continue
+            torvik = name_map.get(ms)
+            if torvik and torvik in all_stats:
+                stats = all_stats[torvik]
+                stats.seed = seed
+                stats.region = r_idx
+                team_lookup[ms] = stats
+            else:
+                team_lookup[ms] = _seed_prior_stats(ms, seed)
+
+    # Also add first-four teams
+    for t1, t2, seed in first_four:
+        for ff_team in (t1, t2):
+            ms = ff_team.strip()
+            if ms not in team_lookup:
+                torvik = name_map.get(ms)
+                if torvik and torvik in all_stats:
+                    stats = all_stats[torvik]
+                    stats.seed = seed
+                    team_lookup[ms] = stats
+                else:
+                    team_lookup[ms] = _seed_prior_stats(ms, seed)
+
+    # Compute z-scores across all teams in the lookup
+    z_scores = compute_z_scores(team_lookup)
+
+    data_teams = sum(1 for ts in team_lookup.values() if ts.has_data)
+    console.print(
+        f"[green]{data_teams} teams with Torvik data, "
+        f"{len(team_lookup) - data_teams} using seed priors[/green]\n"
+    )
+
+    # Run baseline simulation
+    console.print("[bold]Running baseline simulation (no focus stat)...[/bold]")
+    baseline = simulate_bracket(
+        regions, first_four, team_lookup,
+        focus_stat=None, z_scores=z_scores,
+        n_sims=args.sims, rng_seed=args.seed, console=console,
+    )
+
+    # Interactive loop
+    while True:
+        console.print("\n[bold cyan]Select a focus stat to shift win probabilities:[/bold cyan]")
+        for key, (_, label) in FOCUS_STATS.items():
+            console.print(f"  [bold]{key}[/bold]. {label}")
+        console.print("  [bold]0[/bold]. Baseline (no focus stat)")
+        console.print("  [bold]q[/bold]. Quit")
+
+        choice = Prompt.ask("\n[bold]Choose", choices=list(FOCUS_STATS.keys()) + ["0", "q"])
+
+        if choice == "q":
+            console.print("[bold]Goodbye![/bold]")
+            break
+
+        if choice == "0":
+            focus = None
+            label = "Baseline"
+        else:
+            focus, label = FOCUS_STATS[choice]
+
+        console.print(f"\n[bold]Simulating with focus: {label}...[/bold]")
+
+        results = simulate_bracket(
+            regions, first_four, team_lookup,
+            focus_stat=focus, z_scores=z_scores,
+            n_sims=args.sims, rng_seed=args.seed, console=console,
+        )
+
+        display_results(
+            results, regions, first_four,
+            focus, label,
+            baseline_results=baseline if focus else None,
+            console=console,
+        )
+
+
+if __name__ == "__main__":
+    main()
