@@ -121,6 +121,7 @@ def _seed_prior_stats(team_name: str, seed: int) -> "TeamStats":
         seed=seed,
         adj_margin=margin,
         eff_margin=margin * 0.8,
+        experience=SEED_EXPERIENCE.get(seed, 1.0),
     )
 
 
@@ -157,6 +158,18 @@ class TeamStats:
     rebound_diff: float = 0.0
     ftr_diff: float = 0.0
     wab: float = 0.0
+    # Cinderella
+    experience: float = 0.0
+    cinderella_score: float = 0.0
+
+
+# Seed-based experience priors (years of experience typical per seed)
+SEED_EXPERIENCE = {
+    1: 1.8, 2: 1.7, 3: 1.6, 4: 1.5,
+    5: 1.4, 6: 1.4, 7: 1.3, 8: 1.3,
+    9: 1.2, 10: 1.2, 11: 1.1, 12: 1.1,
+    13: 1.0, 14: 1.0, 15: 0.9, 16: 0.8,
+}
 
 
 def load_team_stats(db_path: str, torvik_name: str) -> TeamStats | None:
@@ -210,6 +223,14 @@ def load_team_stats(db_path: str, torvik_name: str) -> TeamStats | None:
     last_10_avg = sum(last_10) / len(last_10) if last_10 else 0
     ts.late_season_trend = last_10_avg - full_avg
 
+    # Experience — pull from team_season_stats; will fall back to seed prior later
+    exp_row = conn.execute(
+        "SELECT experience FROM team_season_stats WHERE team = ?", (torvik_name,)
+    ).fetchone()
+    if exp_row and exp_row["experience"] is not None:
+        ts.experience = exp_row["experience"]
+    # (seed-based fallback applied in main() after seed is assigned)
+
     conn.close()
     return ts
 
@@ -228,6 +249,7 @@ FOCUS_STATS = {
     "7": ("rebound_diff", "Rebounding Differential (OFF reb% - DEF reb%)"),
     "8": ("ftr_diff", "Free Throw Rate Differential"),
     "9": ("wab", "Wins Above Bubble"),
+    "10": ("cinderella_score", "Cinderella Potential (composite upset score)"),
 }
 
 
@@ -296,12 +318,46 @@ def win_probability(
     return max(0.02, min(0.98, base_p))
 
 
+# Cinderella score weights
+_CIND_WEIGHTS = {
+    "three_pt_variance": 0.35,
+    "experience": 0.30,
+    "three_pt_pct": 0.20,
+    "wab": 0.15,
+}
+
+
+def compute_cinderella_score(
+    team_stats: TeamStats, z_scores: dict[str, dict[str, float]]
+) -> float:
+    """Weighted z-score sum for Cinderella profile.  Raw value — caller rescales."""
+    team_z = z_scores.get(team_stats.team, {})
+    return sum(w * team_z.get(stat, 0.0) for stat, w in _CIND_WEIGHTS.items())
+
+
 def compute_z_scores(all_stats: dict[str, TeamStats]) -> dict[str, dict[str, float]]:
-    """Compute z-scores for each focus stat across all teams."""
-    stat_names = [s[0] for s in FOCUS_STATS.values()]
+    """Compute z-scores for each focus stat across all teams.
+
+    Includes `experience` (used in the cinderella score) and the composite
+    `cinderella_score` itself.  The cinderella_score z-scores are computed in
+    a second pass after the component z-scores exist, then rescaled to 0–100
+    and stored on each TeamStats object.
+    """
+    # All individual stats to z-score (includes experience and all focus stats)
+    stat_names = [s[0] for s in FOCUS_STATS.values()] + ["experience"]
+    # deduplicate while preserving order
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for s in stat_names:
+        if s not in seen:
+            seen.add(s)
+            ordered.append(s)
+
     z_scores: dict[str, dict[str, float]] = {}
 
-    for stat_name in stat_names:
+    for stat_name in ordered:
+        if stat_name == "cinderella_score":
+            continue  # computed in second pass
         values = [getattr(ts, stat_name, 0.0) for ts in all_stats.values()]
         if not values:
             continue
@@ -313,6 +369,29 @@ def compute_z_scores(all_stats: dict[str, TeamStats]) -> dict[str, dict[str, flo
             z_scores.setdefault(ts.team, {})[stat_name] = (
                 (getattr(ts, stat_name, 0.0) - mean) / std
             )
+
+    # Second pass: compute raw cinderella scores, rescale to 0–100, store on TeamStats
+    raw_scores = {
+        ts.team: compute_cinderella_score(ts, z_scores) for ts in all_stats.values()
+    }
+    raw_vals = list(raw_scores.values())
+    raw_min = min(raw_vals) if raw_vals else 0.0
+    raw_max = max(raw_vals) if raw_vals else 1.0
+    raw_range = raw_max - raw_min if raw_max != raw_min else 1.0
+
+    for ts in all_stats.values():
+        ts.cinderella_score = 100.0 * (raw_scores[ts.team] - raw_min) / raw_range
+
+    # Now z-score the cinderella_score itself for use as a focus stat
+    cind_values = [ts.cinderella_score for ts in all_stats.values()]
+    cind_mean = sum(cind_values) / len(cind_values) if cind_values else 0.0
+    cind_std = statistics.stdev(cind_values) if len(cind_values) > 1 else 1.0
+    if cind_std == 0:
+        cind_std = 1.0
+    for ts in all_stats.values():
+        z_scores.setdefault(ts.team, {})["cinderella_score"] = (
+            (ts.cinderella_score - cind_mean) / cind_std
+        )
 
     return z_scores
 
@@ -560,6 +639,7 @@ def display_results(
     focus_label: str,
     baseline_results: dict | None,
     console: Console,
+    team_lookup: dict | None = None,
 ):
     """Display full simulation results."""
     n = results["n_sims"]
@@ -642,8 +722,11 @@ def display_results(
         if seed is not None and seed >= 10:
             r32_pct = 100 * counts[1] / n
             s16_pct = 100 * counts[2] / n
+            e8_pct = 100 * counts[3] / n
             if r32_pct > 5 or s16_pct > 1:
-                cinderellas.append((_s(team), seed, r32_pct, s16_pct))
+                ts = (team_lookup or {}).get(team.strip())
+                c_score = round(ts.cinderella_score) if ts else 0
+                cinderellas.append((_s(team), seed, r32_pct, s16_pct, e8_pct, c_score))
 
     if cinderellas:
         cind_table = Table(
@@ -653,12 +736,17 @@ def display_results(
         )
         cind_table.add_column("Seed", justify="right", width=4)
         cind_table.add_column("Team", width=20)
+        cind_table.add_column("C-Score", justify="right", width=7)
         cind_table.add_column("R32 %", justify="right", width=8)
         cind_table.add_column("S16 %", justify="right", width=8)
+        cind_table.add_column("E8 %", justify="right", width=8)
 
-        cinderellas.sort(key=lambda x: x[3], reverse=True)
-        for team, seed, r32_p, s16_p in cinderellas:
-            cind_table.add_row(str(seed), team, f"{r32_p:5.1f}%", f"{s16_p:5.1f}%")
+        cinderellas.sort(key=lambda x: x[5], reverse=True)
+        for team, seed, r32_p, s16_p, e8_p, c_score in cinderellas:
+            cind_table.add_row(
+                str(seed), team, str(c_score),
+                f"{r32_p:5.1f}%", f"{s16_p:5.1f}%", f"{e8_p:5.1f}%",
+            )
         console.print(cind_table)
         console.print()
 
@@ -800,6 +888,11 @@ def main():
                 else:
                     team_lookup[ms] = _seed_prior_stats(ms, seed)
 
+    # Apply seed-based experience prior for teams that have no scraped value
+    for ts in team_lookup.values():
+        if ts.experience == 0.0 and ts.seed > 0:
+            ts.experience = SEED_EXPERIENCE.get(ts.seed, 1.0)
+
     # Compute z-scores across all teams in the lookup
     z_scores = compute_z_scores(team_lookup)
 
@@ -825,7 +918,10 @@ def main():
         console.print("  [bold]0[/bold]. Baseline (no focus stat)")
         console.print("  [bold]q[/bold]. Quit")
 
-        choice = Prompt.ask("\n[bold]Choose", choices=list(FOCUS_STATS.keys()) + ["0", "q"])
+        choice = Prompt.ask(
+            "\n[bold]Choose",
+            choices=list(FOCUS_STATS.keys()) + ["0", "q"],
+        )
 
         if choice == "q":
             console.print("[bold]Goodbye![/bold]")
@@ -850,6 +946,7 @@ def main():
             focus, label,
             baseline_results=baseline if focus else None,
             console=console,
+            team_lookup=team_lookup,
         )
 
 

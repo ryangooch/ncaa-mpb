@@ -29,6 +29,15 @@ REQUEST_DELAY = (2.5, 5.0)  # seconds between requests (min, max)
 # Database setup
 # ---------------------------------------------------------------------------
 
+CREATE_TEAM_SEASON_STATS_TABLE = """
+CREATE TABLE IF NOT EXISTS team_season_stats (
+    team        TEXT    NOT NULL,
+    year        INTEGER NOT NULL,
+    experience  REAL,
+    PRIMARY KEY (team, year)
+);
+"""
+
 CREATE_GAMES_TABLE = """
 CREATE TABLE IF NOT EXISTS games (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,6 +83,7 @@ CREATE TABLE IF NOT EXISTS games (
 def init_db(db_path=DB_PATH):
     conn = sqlite3.connect(db_path)
     conn.execute(CREATE_GAMES_TABLE)
+    conn.execute(CREATE_TEAM_SEASON_STATS_TABLE)
     conn.commit()
     return conn
 
@@ -84,21 +94,26 @@ def init_db(db_path=DB_PATH):
 
 def _get_page_selenium(url):
     from selenium import webdriver
-    from selenium.webdriver.firefox.options import Options
+    from selenium.webdriver.chrome.options import Options
+    from selenium.webdriver.chrome.service import Service
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
     opts = Options()
     opts.add_argument("--headless")
-    browser = webdriver.Firefox(options=opts)
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument(
+        "user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
+    browser = webdriver.Chrome(options=opts)
     try:
         browser.get(url)
-        # Wait for the schedule table to render
         WebDriverWait(browser, 15).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "table"))
         )
-        # Extra pause for JS rendering
         time.sleep(2)
         return browser.page_source
     finally:
@@ -108,11 +123,15 @@ def _get_page_selenium(url):
 def _get_page_playwright(url):
     from playwright.sync_api import sync_playwright
 
+    ua = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    )
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, wait_until="networkidle")
-        page.wait_for_selector("table", timeout=15000)
+        ctx = browser.new_context(user_agent=ua)
+        page = ctx.new_page()
+        page.goto(url, wait_until="load", timeout=30000)
         html = page.content()
         browser.close()
         return html
@@ -122,8 +141,7 @@ def get_page(url):
     """Fetch fully-rendered HTML from *url*, trying Selenium then Playwright."""
     try:
         return _get_page_selenium(url)
-    except Exception as exc:
-        print(f"  Selenium failed ({exc}), trying Playwright …")
+    except Exception:
         return _get_page_playwright(url)
 
 
@@ -333,6 +351,64 @@ def get_tourney_teams(year=YEAR):
 
 
 # ---------------------------------------------------------------------------
+# Experience rating
+# ---------------------------------------------------------------------------
+
+TORVIK_TEAM_TABLES_URL = "https://barttorvik.com/team-tables_each.php?year={year}"
+
+
+def scrape_all_experience(year: int = YEAR, db_path: str = DB_PATH) -> dict[str, float]:
+    """Fetch experience ratings for all teams from Torvik's team-tables page.
+
+    Returns a dict mapping team name → experience value, and upserts all
+    results into team_season_stats.  One page load covers every team.
+    """
+    url = TORVIK_TEAM_TABLES_URL.format(year=year)
+    print(f"Fetching experience data from {url} …")
+    html = get_page(url)
+    soup = BeautifulSoup(html, "lxml")
+
+    table = soup.find("table")
+    if table is None:
+        print("  WARNING: could not find team-tables table")
+        return {}
+
+    headers = [th.get_text(strip=True) for th in table.find_all("th")]
+    if "Exp." not in headers:
+        print("  WARNING: 'Exp.' column not found in team-tables page")
+        return {}
+
+    exp_idx = headers.index("Exp.")
+    # 'Team' appears twice (first and last); use the first occurrence
+    team_idx = headers.index("Team")
+
+    results = {}
+    conn = sqlite3.connect(db_path)
+    for row in table.find_all("tr"):
+        cells = row.find_all(["td", "th"])
+        if len(cells) <= max(exp_idx, team_idx):
+            continue
+        team_name = cells[team_idx].get_text(strip=True)
+        exp_val = _safe_float(cells[exp_idx].get_text(strip=True))
+        if not team_name or exp_val is None:
+            continue
+        results[team_name] = exp_val
+        conn.execute(
+            "INSERT OR REPLACE INTO team_season_stats (team, year, experience) VALUES (?, ?, ?)",
+            (team_name, year, exp_val),
+        )
+    conn.commit()
+    conn.close()
+    return results
+
+
+def scrape_experience(team: str, year: int = YEAR, db_path: str = DB_PATH) -> float | None:
+    """Fetch the experience rating for a single team (used during full scrape)."""
+    all_exp = scrape_all_experience(year, db_path)
+    return all_exp.get(team)
+
+
+# ---------------------------------------------------------------------------
 # Scraping orchestrator
 # ---------------------------------------------------------------------------
 
@@ -361,6 +437,32 @@ def insert_games(conn, games):
     conn.commit()
 
 
+def scrape_experience_only(teams=None, year=YEAR, db_path=DB_PATH):
+    """
+    Fetch only experience ratings without re-scraping game data.
+
+    Pulls all teams from Torvik's team-tables page in a single request, then
+    optionally filters to the requested team list.  Much faster than a full
+    scrape — one page load vs. one per team.
+    """
+    init_db(db_path)
+
+    all_exp = scrape_all_experience(year, db_path)
+
+    if teams is not None:
+        # Report only the requested subset; DB already has all teams
+        for team in teams:
+            exp = all_exp.get(team)
+            if exp is not None:
+                print(f"  {team}: exp={exp:.3f}")
+            else:
+                print(f"  {team}: not found (team name may differ from Torvik's)")
+    else:
+        print(f"\nSaved experience for {len(all_exp)} teams.")
+
+    print(f"Done. Experience ratings saved to {db_path}")
+
+
 def scrape_all_teams(teams=None, year=YEAR, db_path=DB_PATH):
     """
     Scrape game-by-game stats for each team and store in SQLite.
@@ -379,6 +481,10 @@ def scrape_all_teams(teams=None, year=YEAR, db_path=DB_PATH):
     if teams is None:
         teams = get_tourney_teams(year)
 
+    # Fetch all experience ratings in one request up front
+    print("Fetching experience ratings …")
+    all_exp = scrape_all_experience(year, db_path)
+
     total = len(teams)
     print(f"\nScraping {total} teams for {year} season …\n")
 
@@ -391,7 +497,9 @@ def scrape_all_teams(teams=None, year=YEAR, db_path=DB_PATH):
             html = get_page(url)
             games = parse_team_page(html, team, year)
             insert_games(conn, games)
-            print(f"{len(games)} games")
+            exp = all_exp.get(team)
+            exp_str = f", exp={exp:.2f}" if exp is not None else ""
+            print(f"{len(games)} games{exp_str}")
         except Exception as exc:
             print(f"ERROR: {exc}")
 
@@ -433,8 +541,15 @@ if __name__ == "__main__":
         "--delay-max", type=float, default=REQUEST_DELAY[1],
         help=f"Max delay between requests in seconds (default: {REQUEST_DELAY[1]})"
     )
+    parser.add_argument(
+        "--experience-only", action="store_true",
+        help="Only scrape experience ratings (skips game data); much faster"
+    )
     args = parser.parse_args()
 
     REQUEST_DELAY = (args.delay_min, args.delay_max)
 
-    scrape_all_teams(teams=args.teams, year=args.year, db_path=args.db)
+    if args.experience_only:
+        scrape_experience_only(teams=args.teams, year=args.year, db_path=args.db)
+    else:
+        scrape_all_teams(teams=args.teams, year=args.year, db_path=args.db)
