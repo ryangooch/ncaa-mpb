@@ -1533,11 +1533,15 @@ def main():
                     )
                     inj_status = {normalize_name(inj.player): inj.status for inj in injuries}
 
+                    # Team context: efficiency ratings of rostered players
+                    team_ppgs = [p.ppg for p in roster if p.ppg is not None and (p.min_pct or 0) > 5]
+                    team_max_ppg = max(team_ppgs) if team_ppgs else 1.0
+
                     penalty = 0.0
                     for inj_name, player in matched:
                         status = inj_status.get(normalize_name(inj_name), "Out")
                         min_pct = player.min_pct or 0
-                        bpm = player.bpm or 0
+                        ppg = player.ppg or 0
                         gp = player.gp or 0
 
                         # Recency factor: what fraction of games did they play?
@@ -1545,8 +1549,12 @@ def main():
                         # Low gp_ratio = been out a long time → already baked into stats
                         gp_ratio = gp / team_total_gp if team_total_gp > 0 else 0.5
 
-                        # Contribution score: high minutes + positive BPM = more valuable
-                        contribution = (min_pct / 100) * max(bpm + 3, 0) / 6
+                        # Efficiency-relative contribution: player's PPG (PRPG!)
+                        # as a ratio of the team's best player. A team's star
+                        # (ratio ~1.0) losing games is devastating; losing the
+                        # 7th-best player (ratio ~0.3) is much less impactful.
+                        ppg_ratio = ppg / team_max_ppg if team_max_ppg > 0 else 0
+                        contribution = ppg_ratio * (min_pct / 100)
 
                         # Status multiplier
                         status_mult = {"Out For Season": 1.0, "Out": 0.9, "Game Time Decision": 0.3}.get(status, 0.5)
@@ -1560,7 +1568,7 @@ def main():
                         if player_penalty > 0.005:
                             impact_details.append((
                                 bracket_name, player.player, status,
-                                min_pct, bpm, gp, team_total_gp, gp_ratio,
+                                min_pct, ppg, ppg_ratio, gp, team_total_gp, gp_ratio,
                                 player_penalty,
                             ))
 
@@ -1577,29 +1585,34 @@ def main():
                     # Show detailed impact table
                     if impact_details:
                         inj_table = Table(
-                            title="Injury Impact (Contribution-Weighted)",
+                            title="Injury Impact (Efficiency-Weighted)",
                             show_header=True, header_style="bold red",
                         )
                         inj_table.add_column("Team", width=18)
                         inj_table.add_column("Player", width=18)
                         inj_table.add_column("Status", width=16)
                         inj_table.add_column("Min%", justify="right", width=5)
-                        inj_table.add_column("BPM", justify="right", width=6)
+                        inj_table.add_column("PPG", justify="right", width=5)
+                        inj_table.add_column("Eff%", justify="right", width=5)
                         inj_table.add_column("GP", justify="right", width=6)
                         inj_table.add_column("Recency", justify="right", width=7)
                         inj_table.add_column("Penalty", justify="right", width=7)
 
-                        impact_details.sort(key=lambda x: x[8], reverse=True)
-                        for (team, player, status, min_pct, bpm, gp,
-                             total_gp, gp_ratio, pen) in impact_details:
+                        impact_details.sort(key=lambda x: x[9], reverse=True)
+                        for (team, player, status, min_pct, ppg, ppg_ratio,
+                             gp, total_gp, gp_ratio, pen) in impact_details:
                             sc = {"Out For Season": "[red]", "Out": "[yellow]",
                                   "Game Time Decision": "[green]"}.get(status, "[dim]")
                             recency_color = "[red]" if gp_ratio > 0.8 else (
                                 "[yellow]" if gp_ratio > 0.5 else "[green]"
                             )
+                            eff_color = "[red]" if ppg_ratio > 0.7 else (
+                                "[yellow]" if ppg_ratio > 0.4 else "[green]"
+                            )
                             inj_table.add_row(
                                 team, player, f"{sc}{status}[/]",
-                                f"{min_pct:.0f}", f"{bpm:+.1f}",
+                                f"{min_pct:.0f}", f"{ppg:.1f}",
+                                f"{eff_color}{ppg_ratio:.0%}[/]",
                                 f"{gp}/{total_gp}",
                                 f"{recency_color}{gp_ratio:.0%}[/]",
                                 f"[red]-{pen:.1%}[/]",

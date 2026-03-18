@@ -232,6 +232,9 @@ def get_team_injury_impact(
     Returns a value that can be used to scale down a team's adj_margin.
     1.0 = no injured players, lower = more impacted.
 
+    This is a simple fallback used when player stats are unavailable.
+    The whatif.py simulator uses the more accurate PPG-relative penalty.
+
     Heuristic: each player "Out" costs ~2% of team strength,
     "Out For Season" costs ~2.5%, "Game Time Decision" costs ~0.5%.
     Capped at 15% total penalty.
@@ -260,6 +263,9 @@ def get_all_team_impacts(
     """Get injury impact multipliers for all bracket teams.
 
     Returns dict mapping bracket team name → multiplier (1.0 = healthy).
+
+    This is a simple fallback used when player stats are unavailable.
+    The whatif.py simulator uses the more accurate PPG-relative penalty.
     """
     # Build reverse lookup: bracket_name → rotowire search terms
     all_injuries = get_latest_injuries(conn)
