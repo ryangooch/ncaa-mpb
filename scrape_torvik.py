@@ -111,7 +111,7 @@ def _get_page_selenium(url):
     browser = webdriver.Chrome(options=opts)
     try:
         browser.get(url)
-        WebDriverWait(browser, 15).until(
+        WebDriverWait(browser, 30).until(
             EC.presence_of_element_located((By.CSS_SELECTOR, "table"))
         )
         time.sleep(2)
@@ -132,17 +132,31 @@ def _get_page_playwright(url):
         ctx = browser.new_context(user_agent=ua)
         page = ctx.new_page()
         page.goto(url, wait_until="load", timeout=30000)
+        # Wait for JS-rendered tables to appear in the DOM
+        page.wait_for_selector("table", timeout=30000)
+        page.wait_for_timeout(2000)
         html = page.content()
         browser.close()
         return html
 
 
-def get_page(url):
-    """Fetch fully-rendered HTML from *url*, trying Selenium then Playwright."""
-    try:
-        return _get_page_selenium(url)
-    except Exception:
-        return _get_page_playwright(url)
+def get_page(url, retries: int = 3):
+    """Fetch fully-rendered HTML from *url*, trying Selenium then Playwright.
+
+    Retries up to *retries* times on failure, alternating between backends.
+    """
+    backends = [_get_page_selenium, _get_page_playwright]
+    last_exc = None
+    for attempt in range(retries):
+        for backend in backends:
+            try:
+                return backend(url)
+            except Exception as exc:
+                last_exc = exc
+                continue
+        # Exponential backoff before retrying the full cycle
+        time.sleep(3 * (attempt + 1))
+    raise RuntimeError(f"Failed to fetch {url} after {retries} attempts: {last_exc}")
 
 
 # ---------------------------------------------------------------------------
