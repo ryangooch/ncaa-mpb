@@ -640,6 +640,7 @@ def display_results(
     baseline_results: dict | None,
     console: Console,
     team_lookup: dict | None = None,
+    market_odds: tuple | None = None,
 ):
     """Display full simulation results."""
     n = results["n_sims"]
@@ -754,6 +755,141 @@ def display_results(
     if baseline_results and focus_stat:
         _display_impact(results, baseline_results, focus_label, console)
 
+    # Market comparison
+    if market_odds:
+        _display_market_comparison(results, regions, first_four, market_odds, console)
+
+
+def _display_market_comparison(results, regions, first_four, market_odds, console):
+    """Show Monte Carlo championship % vs market-implied % with edge detection."""
+    futures_map, matchup_map = market_odds
+
+    n = results["n_sims"]
+    champs = results["champion_counts"]
+
+    if futures_map:
+        table = Table(
+            title="[bold]Model vs Market — Championship Odds[/bold]",
+            show_header=True,
+            header_style="bold green",
+        )
+        table.add_column("Team", width=20)
+        table.add_column("Seed", justify="right", width=4)
+        table.add_column("Model %", justify="right", width=9)
+        table.add_column("Market %", justify="right", width=9)
+        table.add_column("Edge", justify="right", width=8)
+        table.add_column("Best Odds", justify="right", width=10)
+
+        rows = []
+        for team_name in set(list(champs.keys()) + list(futures_map.keys())):
+            model_pct = 100 * champs.get(team_name, 0) / n
+            fut = futures_map.get(team_name)
+            if fut is None and model_pct < 0.1:
+                continue
+            market_pct = 100 * fut.implied_prob if fut else 0.0
+            edge = model_pct - market_pct
+            seed = _find_seed(team_name, regions, first_four)
+            best = f"+{fut.best_price}" if fut and fut.best_price > 0 else (str(fut.best_price) if fut else "")
+            rows.append((team_name, seed or 0, model_pct, market_pct, edge, best))
+
+        rows.sort(key=lambda r: abs(r[4]), reverse=True)
+        for team_name, seed, model_pct, market_pct, edge, best in rows[:20]:
+            sign = "+" if edge > 0 else ""
+            color = "[green]" if edge > 1.0 else ("[red]" if edge < -1.0 else "[dim]")
+            table.add_row(
+                _s(team_name),
+                str(seed) if seed else "",
+                f"{model_pct:5.1f}%",
+                f"{market_pct:5.1f}%" if market_pct > 0 else "[dim]—[/dim]",
+                f"{color}{sign}{edge:4.1f}%[/]",
+                best,
+            )
+
+        console.print(table)
+        console.print()
+
+        # Value picks summary
+        value_picks = [(t, s, m, mk, e) for t, s, m, mk, e, _ in rows if e > 1.0]
+        if value_picks:
+            console.print("[bold green]Value Picks[/bold green] (model significantly higher than market):")
+            for team, seed, model_pct, market_pct, edge in value_picks[:5]:
+                console.print(
+                    f"  ({seed:>2}) {_s(team):18s}  model {model_pct:.1f}% vs market {market_pct:.1f}%"
+                    f"  [green]+{edge:.1f}% edge[/green]"
+                )
+            console.print()
+
+        fades = [(t, s, m, mk, e) for t, s, m, mk, e, _ in rows if e < -1.0]
+        if fades:
+            console.print("[bold red]Market Favorites to Fade[/bold red] (model significantly lower than market):")
+            for team, seed, model_pct, market_pct, edge in fades[:5]:
+                console.print(
+                    f"  ({seed:>2}) {_s(team):18s}  model {model_pct:.1f}% vs market {market_pct:.1f}%"
+                    f"  [red]{edge:.1f}% edge[/red]"
+                )
+            console.print()
+
+    if matchup_map:
+        # Find upcoming matchups where both teams are in our bracket
+        bracket_matchups = [
+            m for m in matchup_map
+            if m.home_bracket and m.away_bracket
+        ]
+        if bracket_matchups:
+            table = Table(
+                title="[bold]Matchup Odds — Model vs Market[/bold]",
+                show_header=True,
+                header_style="bold cyan",
+            )
+            table.add_column("Matchup", width=35)
+            table.add_column("Model", justify="right", width=8)
+            table.add_column("Market", justify="right", width=8)
+            table.add_column("Edge", justify="right", width=8)
+            table.add_column("Spread", justify="right", width=7)
+
+            adv = results["advancement"]
+            for m in bracket_matchups:
+                home = m.home_bracket or _s(m.home_team)
+                away = m.away_bracket or _s(m.away_team)
+                # Model R64 win rate for the home team
+                home_wins = adv.get(home, [0] * 7)[0]
+                away_wins = adv.get(away, [0] * 7)[0]
+                total_wins = home_wins + away_wins
+                if total_wins > 0:
+                    model_home_pct = 100 * home_wins / total_wins
+                else:
+                    model_home_pct = 50.0
+                market_home_pct = 100 * m.home_h2h_prob
+                edge = model_home_pct - market_home_pct
+
+                sign = "+" if edge > 0 else ""
+                color = "[green]" if abs(edge) > 5 else "[dim]"
+
+                # Show the favored team's perspective
+                if model_home_pct >= 50:
+                    label = f"{_s(home)} vs {_s(away)}"
+                    model_str = f"{model_home_pct:.0f}%"
+                    market_str = f"{market_home_pct:.0f}%"
+                else:
+                    label = f"{_s(away)} vs {_s(home)}"
+                    model_str = f"{100 - model_home_pct:.0f}%"
+                    market_str = f"{100 - market_home_pct:.0f}%"
+                    edge = -edge
+
+                sign = "+" if edge > 0 else ""
+                color = "[green]" if edge > 5 else ("[red]" if edge < -5 else "[dim]")
+
+                table.add_row(
+                    label,
+                    model_str,
+                    market_str,
+                    f"{color}{sign}{edge:.0f}%[/]",
+                    f"{m.spread:+.1f}" if m.spread else "",
+                )
+
+            console.print(table)
+            console.print()
+
 
 def _find_seed(team: str, regions: dict, first_four: list) -> int | None:
     """Find a team's seed from regions or first four."""
@@ -813,7 +949,14 @@ def main():
     parser.add_argument("--db", default="torvik_game_stats.db", help="Torvik game stats DB path")
     parser.add_argument("--sims", type=int, default=10_000, help="Number of simulations")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--odds", action="store_true", help="Show cached betting odds comparison")
+    parser.add_argument("--fetch-live-odds", action="store_true", help="Fetch fresh odds from API (implies --odds)")
+    parser.add_argument("--injuries", action="store_true", help="Apply injury adjustments to team strength")
+    parser.add_argument("--injury-db", default="injuries.db", help="Injury database path")
     args = parser.parse_args()
+
+    if args.fetch_live_odds:
+        args.odds = True
 
     console = Console()
     console.print("[bold]Loading bracket data...[/bold]")
@@ -902,6 +1045,73 @@ def main():
         f"{len(team_lookup) - data_teams} using seed priors[/green]\n"
     )
 
+    # Apply injury adjustments if requested
+    if args.injuries:
+        try:
+            from injuries import init_db as inj_init_db, get_all_team_impacts, display_team_impacts
+            inj_conn = inj_init_db(args.injury_db)
+            impacts = get_all_team_impacts(inj_conn, list(team_lookup.keys()))
+            impacted_count = sum(1 for m in impacts.values() if m < 1.0)
+            if impacted_count:
+                console.print(f"[bold]Applying injury adjustments to {impacted_count} teams...[/bold]")
+                display_team_impacts(impacts, console)
+                console.print()
+                for team_name, mult in impacts.items():
+                    if mult < 1.0 and team_name in team_lookup:
+                        ts = team_lookup[team_name]
+                        ts.adj_margin *= mult
+                        ts.eff_margin *= mult
+            else:
+                console.print("[green]No bracket teams with injuries.[/green]\n")
+            inj_conn.close()
+        except Exception as exc:
+            console.print(f"[yellow]Could not load injuries: {exc}[/yellow]\n")
+
+    # Load market odds if requested
+    market_odds = None
+    if args.odds:
+        try:
+            from odds import (
+                fetch_futures, fetch_matchup_odds,
+                load_cached_futures, load_cached_matchups,
+                _fmt_timestamp,
+            )
+            bracket_name_set = set(bracket_names)
+
+            if args.fetch_live_odds:
+                console.print("[bold]Fetching live betting odds...[/bold]")
+                futures = fetch_futures(bracket_name_set)
+                matchups = fetch_matchup_odds(bracket_name_set)
+                console.print("[green]Odds fetched and cached.[/green]")
+            else:
+                console.print("[bold]Loading cached betting odds...[/bold]")
+                futures, f_ts = load_cached_futures()
+                matchups, m_ts = load_cached_matchups()
+                if not futures and not matchups:
+                    console.print(
+                        "[yellow]No cached odds found. "
+                        "Run with --fetch-live-odds first.[/yellow]\n"
+                    )
+                else:
+                    ts = f_ts or m_ts
+                    console.print(f"[dim]Odds cached at {_fmt_timestamp(ts)}[/dim]")
+
+            # Build futures lookup: bracket name → FuturesOdds
+            futures_map = {}
+            for f in futures:
+                if f.team_bracket and f.team_bracket in bracket_name_set:
+                    futures_map[f.team_bracket] = f
+
+            if futures or matchups:
+                matched_f = len(futures_map)
+                console.print(
+                    f"[green]Matched {matched_f}/{len(futures)} futures, "
+                    f"{len(matchups)} matchups loaded[/green]\n"
+                )
+                market_odds = (futures_map, matchups)
+        except Exception as exc:
+            console.print(f"[yellow]Could not load odds: {exc}[/yellow]\n")
+
     # Run baseline simulation
     console.print("[bold]Running baseline simulation (no focus stat)...[/bold]")
     baseline = simulate_bracket(
@@ -947,6 +1157,7 @@ def main():
             baseline_results=baseline if focus else None,
             console=console,
             team_lookup=team_lookup,
+            market_odds=market_odds,
         )
 
 
