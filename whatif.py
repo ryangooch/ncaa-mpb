@@ -161,6 +161,15 @@ class TeamStats:
     # Cinderella
     experience: float = 0.0
     cinderella_score: float = 0.0
+    # Style profile
+    pace: float = 0.0           # off_eff + def_eff proxy
+    inside_rate: float = 0.5    # 2pa / (2pa + 3pa)
+    three_pt_rate: float = 0.5  # 3pa / (2pa + 3pa)
+    off_reb_rate: float = 0.0   # avg_off_or_pct
+    to_force_rate: float = 0.0  # avg_def_to_pct
+    ft_rate: float = 0.0        # avg_off_ftr
+    def_three_pt_pct: float = 0.0  # opponent 3pt%
+    def_inside_rate: float = 0.5   # opponent 2pa / (2pa + 3pa)
 
 
 # Seed-based experience priors (years of experience typical per seed)
@@ -216,6 +225,33 @@ def load_team_stats(db_path: str, torvik_name: str) -> TeamStats | None:
     if game_3p_pcts:
         ts.three_pt_pct = statistics.mean(game_3p_pcts)
         ts.three_pt_variance = statistics.stdev(game_3p_pcts) if len(game_3p_pcts) > 1 else 0.0
+
+    # Style profile
+    ts.pace = ts.avg_off_eff + ts.avg_def_eff
+    total_off_2pa = sum(r["off_2pa"] or 0 for r in rows)
+    total_off_3pa = sum(r["off_3pa"] or 0 for r in rows)
+    total_att = total_off_2pa + total_off_3pa
+    if total_att > 0:
+        ts.inside_rate = total_off_2pa / total_att
+        ts.three_pt_rate = total_off_3pa / total_att
+    ts.off_reb_rate = ts.avg_off_or_pct
+    ts.to_force_rate = ts.avg_def_to_pct
+    ts.ft_rate = ts.avg_off_ftr
+
+    # Defensive style
+    total_def_2pa = sum(r["def_2pa"] or 0 for r in rows)
+    total_def_3pa = sum(r["def_3pa"] or 0 for r in rows)
+    total_def_att = total_def_2pa + total_def_3pa
+    if total_def_att > 0:
+        ts.def_inside_rate = total_def_2pa / total_def_att
+    def_3p_pcts = []
+    for r in rows:
+        datt = r["def_3pa"]
+        dmade = r["def_3pm"]
+        if datt and datt > 0:
+            def_3p_pcts.append(dmade / datt)
+    if def_3p_pcts:
+        ts.def_three_pt_pct = statistics.mean(def_3p_pcts)
 
     full_margins = [(r["off_eff"] or 0) - (r["def_eff"] or 0) for r in rows]
     full_avg = sum(full_margins) / len(full_margins) if full_margins else 0
@@ -302,18 +338,123 @@ def win_probability(
     if focus_stat:
         z_a = z_scores.get(team_a.team, {}).get(focus_stat, 0.0)
         z_b = z_scores.get(team_b.team, {}).get(focus_stat, 0.0)
-        shift = 0.05 * (z_a - z_b)
-        shift = max(-0.15, min(0.15, shift))
+        shift_weight = 0.1
+        shift = shift_weight * (z_a - z_b)
+        shift = max(-0.25, min(0.25, shift))
 
         # 3-point variance special: high variance slightly boosts underdog
         if is_3pt_focus and team_a.seed > team_b.seed:
-            var_boost = 0.02 * z_a
+            var_boost = 0.05 * z_a
             shift += max(0, min(0.05, var_boost))
         elif is_3pt_focus and team_b.seed > team_a.seed:
-            var_boost = 0.02 * z_b
+            var_boost = 0.05 * z_b
             shift -= max(0, min(0.05, var_boost))
 
         base_p += shift
+
+    return max(0.02, min(0.98, base_p))
+
+
+# ---------------------------------------------------------------------------
+# Style mismatch & composite model
+# ---------------------------------------------------------------------------
+
+def style_mismatch_bonus(underdog: TeamStats, favorite: TeamStats) -> float:
+    """Compute a mismatch bonus (0 to ~0.08) for the underdog.
+
+    Looks at whether the underdog's offensive strengths exploit the
+    favorite's defensive weaknesses, which is how real upsets happen.
+    """
+    bonus = 0.0
+
+    # Underdog shoots lots of 3s and favorite gives up high 3pt%
+    if underdog.three_pt_rate > 0.4 and favorite.def_three_pt_pct > 0.34:
+        bonus += 2*0.025
+
+    # Underdog forces turnovers and favorite is turnover-prone
+    if underdog.to_force_rate > 18.0 and favorite.avg_off_to_pct > 17.0:
+        bonus += 2*0.02
+
+    # Underdog crashes boards and favorite weak on def rebounding
+    if underdog.off_reb_rate > 30.0 and favorite.avg_def_or_pct > 28.0:
+        bonus += 2*0.015
+
+    # Pace mismatch: slow underdog vs fast favorite (tempo control)
+    pace_diff = favorite.pace - underdog.pace
+    if pace_diff > 15:
+        bonus += 2*0.02
+
+    return min(bonus, 0.08)
+
+
+# Composite signal weights for bracket filling
+_COMPOSITE_WEIGHTS = {
+    "adj_margin":        0.30,
+    "three_pt_variance": 0.12,
+    "three_pt_pct":      0.08,
+    "late_season_trend": 0.10,
+    "turnover_diff":     0.05,
+    "experience":        0.08,
+    "cinderella_score":  0.07,
+    "wab":               0.05,
+    "rebound_diff":      0.05,
+    "ftr_diff":          0.03,
+}
+# Remaining 0.07 comes from style mismatch (applied separately)
+
+
+def composite_win_probability(
+    team_a: TeamStats,
+    team_b: TeamStats,
+    round_num: int,
+    z_scores: dict[str, dict[str, float]],
+) -> float:
+    """Compute win probability using all signals blended together.
+
+    Uses the same base (historical + logistic) as the original model,
+    then applies a composite shift from all weighted signals plus a
+    style mismatch bonus for the underdog.
+    """
+    # Base probability (same as win_probability)
+    if round_num == 1 and team_a.seed > 0 and team_b.seed > 0:
+        s_lo = min(team_a.seed, team_b.seed)
+        s_hi = max(team_a.seed, team_b.seed)
+        if (s_lo, s_hi) in SEED_WIN_RATES:
+            base_p = SEED_WIN_RATES[(s_lo, s_hi)]
+            if team_a.seed > team_b.seed:
+                base_p = 1.0 - base_p
+            if team_a.has_data and team_b.has_data:
+                data_p = _logistic(team_a.adj_margin - team_b.adj_margin)
+                base_p = 0.65 * base_p + 0.35 * data_p
+        else:
+            base_p = _logistic(team_a.adj_margin - team_b.adj_margin)
+    else:
+        base_p = _logistic(team_a.adj_margin - team_b.adj_margin)
+
+    # Composite z-score shift from all signals
+    z_a = z_scores.get(team_a.team, {})
+    z_b = z_scores.get(team_b.team, {})
+    shift = 0.0
+    for stat, weight in _COMPOSITE_WEIGHTS.items():
+        diff = z_a.get(stat, 0.0) - z_b.get(stat, 0.0)
+        shift += weight * 0.05 * diff  # 0.05 scales z-diff to probability space
+
+    # 3pt variance underdog boost (high variance = can get hot)
+    if team_a.seed > team_b.seed:
+        var_boost = 0.02 * z_a.get("three_pt_variance", 0.0)
+        shift += max(0, min(0.04, var_boost))
+    elif team_b.seed > team_a.seed:
+        var_boost = 0.02 * z_b.get("three_pt_variance", 0.0)
+        shift -= max(0, min(0.04, var_boost))
+
+    shift = max(-0.20, min(0.20, shift))
+    base_p += shift
+
+    # Style mismatch: boost for the underdog
+    if team_a.seed > team_b.seed and team_a.has_data and team_b.has_data:
+        base_p += style_mismatch_bonus(team_a, team_b)
+    elif team_b.seed > team_a.seed and team_a.has_data and team_b.has_data:
+        base_p -= style_mismatch_bonus(team_b, team_a)
 
     return max(0.02, min(0.98, base_p))
 
@@ -521,11 +662,261 @@ def simulate_bracket(
 
 
 # ---------------------------------------------------------------------------
-# Display helpers
+# Shared constants
 # ---------------------------------------------------------------------------
 
 REGION_NAMES = ["SOUTH", "WEST", "EAST", "MIDWEST"]
 MATCHUP_ORDER = [1, 16, 8, 9, 5, 12, 4, 13, 6, 11, 3, 14, 7, 10, 2, 15]
+
+# ---------------------------------------------------------------------------
+# Bracket filler — single deterministic bracket with smart upsets
+# ---------------------------------------------------------------------------
+
+# Historical average upsets per round (seeds 1-16 matchups in R64)
+# Roughly 5-6 upsets per tournament in R64, ~3 in R32
+_TARGET_R64_UPSETS = 5
+_UPSET_THRESHOLD = 0.22  # if underdog has >= 22% chance, eligible for upset
+
+
+def fill_bracket(
+    regions: dict,
+    first_four: list,
+    team_lookup: dict[str, TeamStats],
+    z_scores: dict[str, dict[str, float]],
+    rng_seed: int | None = None,
+    console: Console | None = None,
+) -> dict:
+    """Generate a single filled bracket using the composite model.
+
+    Instead of pure Monte Carlo, this uses composite probabilities to pick
+    winners, injecting a realistic number of upsets based on cinderella
+    scores and style mismatches. Returns a nested dict of results by round.
+    """
+    rng = np.random.default_rng(rng_seed)
+
+    def get_stats(team_name: str) -> TeamStats:
+        name = team_name.strip()
+        if name in team_lookup:
+            return team_lookup[name]
+        return TeamStats(team=name)
+
+    def pick_winner(a_name: str, b_name: str, round_num: int) -> tuple[str, float]:
+        """Pick a winner using composite model with probabilistic flip.
+
+        Uses the composite probability as a weighted coin flip so that
+        weight changes actually shift outcomes. Returns (winner, p_a).
+        """
+        stats_a = get_stats(a_name)
+        stats_b = get_stats(b_name)
+        p_a = composite_win_probability(stats_a, stats_b, round_num, z_scores)
+        winner = a_name if rng.random() < p_a else b_name
+        return winner, p_a
+
+    def get_seed(team_name: str) -> int:
+        ts = get_stats(team_name)
+        return ts.seed if ts.seed > 0 else 16
+
+    # Resolve First Four
+    ff_winners = []
+    for t1, t2, seed in first_four:
+        winner, _ = pick_winner(t1, t2, 1)
+        ff_winners.append(winner)
+
+    bracket = {"first_four": list(ff_winners), "regions": {}, "final_four": [], "championship": None}
+
+    # Phase 1: build all R64 matchups across regions and collect upset info
+    all_r64_games = []
+    ff_idx = 0  # global index into ff_winners, shared across regions
+    for r_idx in range(4):
+        region = regions[r_idx]
+
+        # Build matchup list (same logic as simulate_bracket)
+        matchups = []
+        for s in MATCHUP_ORDER:
+            team = region.get(s, "TBD")
+            if team == "Play-in":
+                if ff_idx < len(ff_winners):
+                    team = ff_winners[ff_idx]
+                    ff_idx += 1
+            matchups.append(team)
+
+        for i in range(0, 16, 2):
+            a, b = matchups[i], matchups[i + 1]
+            stats_a, stats_b = get_stats(a), get_stats(b)
+            p_a = composite_win_probability(stats_a, stats_b, 1, z_scores)
+
+            seed_a, seed_b = get_seed(a), get_seed(b)
+            if seed_a < seed_b:
+                fav, dog, dog_p = a, b, 1.0 - p_a
+                dog_cinderella = stats_b.cinderella_score
+            elif seed_b < seed_a:
+                fav, dog, dog_p = b, a, p_a
+                dog_cinderella = stats_a.cinderella_score
+            else:
+                fav, dog, dog_p = (a, b, 1.0 - p_a) if p_a >= 0.5 else (b, a, p_a)
+                dog_cinderella = 0
+
+            all_r64_games.append({
+                "a": a, "b": b, "fav": fav, "dog": dog,
+                "dog_p": dog_p, "dog_cinderella": dog_cinderella,
+                "region": r_idx,
+            })
+
+    # Phase 2: decide which R64 games are upsets
+    upset_candidates = [g for g in all_r64_games if g["dog_p"] >= _UPSET_THRESHOLD]
+    for g in upset_candidates:
+        g["upset_score"] = g["dog_p"] * 0.6 + (g["dog_cinderella"] / 100.0) * 0.4
+    upset_candidates.sort(key=lambda g: g["upset_score"], reverse=True)
+
+    n_upsets = _TARGET_R64_UPSETS + int(rng.choice([-1, 0, 0, 1]))
+    n_upsets = max(3, min(7, n_upsets))
+
+    upset_set = set()
+    for g in upset_candidates[:n_upsets]:
+        if rng.random() < g["upset_score"] + 0.3:
+            upset_set.add(id(g))
+    # Backfill if we didn't get enough
+    for g in upset_candidates[n_upsets:n_upsets + 3]:
+        if len(upset_set) < 3 and rng.random() < g["dog_p"]:
+            upset_set.add(id(g))
+
+    # Mark winners on all R64 games
+    for g in all_r64_games:
+        g["winner"] = g["dog"] if id(g) in upset_set else g["fav"]
+        g["upset"] = id(g) in upset_set and get_seed(g["dog"]) > get_seed(g["fav"])
+
+    # Phase 3: fill regions R32 through E8
+    region_winners = []
+    game_idx = 0
+    for r_idx in range(4):
+        bracket["regions"][r_idx] = {"r64": [], "r32": [], "s16": [], "e8": None}
+        region_games = all_r64_games[game_idx:game_idx + 8]
+        game_idx += 8
+
+        r64_winners = []
+        for g in region_games:
+            r64_winners.append(g["winner"])
+            bracket["regions"][r_idx]["r64"].append(g)
+
+        # R32
+        r32_winners = []
+        for i in range(0, 8, 2):
+            a, b = r64_winners[i], r64_winners[i + 1]
+            winner, _ = pick_winner(a, b, 2)
+            r32_winners.append(winner)
+            bracket["regions"][r_idx]["r32"].append({"winner": winner, "a": a, "b": b})
+
+        # S16
+        s16_winners = []
+        for i in range(0, 4, 2):
+            a, b = r32_winners[i], r32_winners[i + 1]
+            winner, _ = pick_winner(a, b, 3)
+            s16_winners.append(winner)
+            bracket["regions"][r_idx]["s16"].append({"winner": winner, "a": a, "b": b})
+
+        # E8
+        e8_winner, _ = pick_winner(s16_winners[0], s16_winners[1], 4)
+        bracket["regions"][r_idx]["e8"] = {
+            "winner": e8_winner, "a": s16_winners[0], "b": s16_winners[1]
+        }
+        region_winners.append(e8_winner)
+
+    # Final Four
+    ff1_winner, _ = pick_winner(region_winners[0], region_winners[1], 5)
+    ff2_winner, _ = pick_winner(region_winners[2], region_winners[3], 5)
+    bracket["final_four"] = [
+        {"winner": ff1_winner, "a": region_winners[0], "b": region_winners[1]},
+        {"winner": ff2_winner, "a": region_winners[2], "b": region_winners[3]},
+    ]
+
+    # Championship
+    champ, _ = pick_winner(ff1_winner, ff2_winner, 6)
+    bracket["championship"] = {"winner": champ, "a": ff1_winner, "b": ff2_winner}
+
+    return bracket
+
+
+def display_filled_bracket(bracket: dict, regions: dict, first_four: list,
+                           team_lookup: dict[str, TeamStats], console: Console):
+    """Display the filled bracket as a rich table."""
+    console.print("\n[bold underline]FILLED BRACKET[/bold underline]\n")
+
+    total_upsets = 0
+
+    for r_idx in range(4):
+        region_data = bracket["regions"][r_idx]
+        console.print(f"[bold cyan]── {REGION_NAMES[r_idx]} ──[/bold cyan]")
+
+        # R64
+        for game in region_data["r64"]:
+            a, b, winner = game["a"], game["b"], game["winner"]
+            ts_a, ts_b = team_lookup.get(a.strip()), team_lookup.get(b.strip())
+            seed_a = ts_a.seed if ts_a else "?"
+            seed_b = ts_b.seed if ts_b else "?"
+            upset = game.get("upset", False)
+            if upset:
+                total_upsets += 1
+                marker = " [bold red]UPSET[/bold red]"
+            else:
+                marker = ""
+            style = "[bold green]" if not upset else "[bold yellow]"
+            console.print(
+                f"  ({seed_a:>2}) {_s(a):18s} vs ({seed_b:>2}) {_s(b):18s}"
+                f"  → {style}{_s(winner)}[/]{marker}"
+            )
+
+        # R32
+        console.print(f"  [dim]Round of 32:[/dim]")
+        for game in region_data["r32"]:
+            w = game["winner"]
+            ts = team_lookup.get(w.strip())
+            seed = ts.seed if ts else "?"
+            console.print(f"    [bold]({seed:>2}) {_s(w)}[/bold]")
+
+        # S16
+        console.print(f"  [dim]Sweet 16:[/dim]")
+        for game in region_data["s16"]:
+            w = game["winner"]
+            ts = team_lookup.get(w.strip())
+            seed = ts.seed if ts else "?"
+            console.print(f"    [bold]({seed:>2}) {_s(w)}[/bold]")
+
+        # E8
+        e8 = region_data["e8"]
+        ts = team_lookup.get(e8["winner"].strip())
+        seed = ts.seed if ts else "?"
+        console.print(f"  [dim]Elite 8 → [/dim][bold magenta]({seed:>2}) {_s(e8['winner'])}[/bold magenta]")
+        console.print()
+
+    # Final Four
+    console.print("[bold cyan]── FINAL FOUR ──[/bold cyan]")
+    for game in bracket["final_four"]:
+        a, b, w = game["a"], game["b"], game["winner"]
+        ts_a = team_lookup.get(a.strip())
+        ts_b = team_lookup.get(b.strip())
+        sa = ts_a.seed if ts_a else "?"
+        sb = ts_b.seed if ts_b else "?"
+        sw = team_lookup.get(w.strip())
+        seed_w = sw.seed if sw else "?"
+        console.print(
+            f"  ({sa:>2}) {_s(a):18s} vs ({sb:>2}) {_s(b):18s}"
+            f"  → [bold magenta]({seed_w}) {_s(w)}[/bold magenta]"
+        )
+
+    # Championship
+    champ = bracket["championship"]
+    a, b, w = champ["a"], champ["b"], champ["winner"]
+    ts_w = team_lookup.get(w.strip())
+    seed_w = ts_w.seed if ts_w else "?"
+    console.print(f"\n[bold cyan]── CHAMPIONSHIP ──[/bold cyan]")
+    console.print(f"  {_s(a)} vs {_s(b)}")
+    console.print(f"\n  [bold yellow]🏆 CHAMPION: ({seed_w}) {_s(w)}[/bold yellow]")
+    console.print(f"\n  [dim]R64 upsets: {total_upsets}[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# Display helpers
+# ---------------------------------------------------------------------------
 
 
 def _pct_style(pct: float) -> str:
@@ -953,6 +1344,8 @@ def main():
     parser.add_argument("--fetch-live-odds", action="store_true", help="Fetch fresh odds from API (implies --odds)")
     parser.add_argument("--injuries", action="store_true", help="Apply injury adjustments to team strength")
     parser.add_argument("--injury-db", default="injuries.db", help="Injury database path")
+    parser.add_argument("--fill-bracket", action="store_true",
+                        help="Generate a single filled bracket using composite model with smart upsets")
     args = parser.parse_args()
 
     if args.fetch_live_odds:
@@ -1111,6 +1504,16 @@ def main():
                 market_odds = (futures_map, matchups)
         except Exception as exc:
             console.print(f"[yellow]Could not load odds: {exc}[/yellow]\n")
+
+    # Fill bracket mode: generate single bracket and exit
+    if args.fill_bracket:
+        console.print("[bold]Generating filled bracket (composite model + smart upsets)...[/bold]\n")
+        filled = fill_bracket(
+            regions, first_four, team_lookup, z_scores,
+            rng_seed=args.seed, console=console,
+        )
+        display_filled_bracket(filled, regions, first_four, team_lookup, console)
+        return
 
     # Run baseline simulation
     console.print("[bold]Running baseline simulation (no focus stat)...[/bold]")
