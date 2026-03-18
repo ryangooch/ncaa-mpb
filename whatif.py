@@ -125,6 +125,33 @@ def _seed_prior_stats(team_name: str, seed: int) -> "TeamStats":
     )
 
 
+def compute_stud_factor(db_path: str, torvik_name: str) -> float:
+    """Compute stud factor for a team from player_stats table.
+
+    Stud factor captures how much star power a team has — players with
+    heavy minutes AND high usage who produce efficiently.
+    Score is sum of (min_pct/100 * usg_pct/100 * max(bpm, 0)) for studs.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT min_pct, usg_pct, bpm, ppg FROM player_stats "
+        "WHERE team = ? AND year = 2026 ORDER BY min_pct DESC",
+        (torvik_name,),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return 0.0
+    score = 0.0
+    for r in rows:
+        min_pct = r["min_pct"] or 0
+        usg = r["usg_pct"] or 0
+        bpm = r["bpm"] or 0
+        if min_pct >= 22 and usg >= 25:
+            score += (min_pct / 100) * (usg / 100) * max(bpm, 0.5)
+    return score
+
+
 # ---------------------------------------------------------------------------
 # Team stats from Torvik DB
 # ---------------------------------------------------------------------------
@@ -161,6 +188,8 @@ class TeamStats:
     # Cinderella
     experience: float = 0.0
     cinderella_score: float = 0.0
+    # Stud factor — how much star power the team has
+    stud_factor: float = 0.0
     # Style profile
     pace: float = 0.0           # off_eff + def_eff proxy
     inside_rate: float = 0.5    # 2pa / (2pa + 3pa)
@@ -286,6 +315,7 @@ FOCUS_STATS = {
     "8": ("ftr_diff", "Free Throw Rate Differential"),
     "9": ("wab", "Wins Above Bubble"),
     "10": ("cinderella_score", "Cinderella Potential (composite upset score)"),
+    "11": ("stud_factor", "Stud Factor (star player impact)"),
 }
 
 
@@ -389,13 +419,14 @@ def style_mismatch_bonus(underdog: TeamStats, favorite: TeamStats) -> float:
 
 # Composite signal weights for bracket filling
 _COMPOSITE_WEIGHTS = {
-    "adj_margin":        0.30,
-    "three_pt_variance": 0.12,
-    "three_pt_pct":      0.08,
-    "late_season_trend": 0.10,
+    "adj_margin":        0.28,
+    "three_pt_variance": 0.11,
+    "three_pt_pct":      0.07,
+    "late_season_trend": 0.09,
     "turnover_diff":     0.05,
-    "experience":        0.08,
-    "cinderella_score":  0.07,
+    "experience":        0.07,
+    "cinderella_score":  0.06,
+    "stud_factor":       0.07,
     "wab":               0.05,
     "rebound_diff":      0.05,
     "ftr_diff":          0.03,
@@ -674,7 +705,7 @@ MATCHUP_ORDER = [1, 16, 8, 9, 5, 12, 4, 13, 6, 11, 3, 14, 7, 10, 2, 15]
 
 # Historical average upsets per round (seeds 1-16 matchups in R64)
 # Roughly 5-6 upsets per tournament in R64, ~3 in R32
-_TARGET_R64_UPSETS = 5
+_TARGET_R64_UPSETS = 10
 _UPSET_THRESHOLD = 0.22  # if underdog has >= 22% chance, eligible for upset
 
 
@@ -692,7 +723,10 @@ def fill_bracket(
     winners, injecting a realistic number of upsets based on cinderella
     scores and style mismatches. Returns a nested dict of results by round.
     """
+    if not rng_seed:
+        rng_seed = np.random.randint(1, high=1_000_000)
     rng = np.random.default_rng(rng_seed)
+    print(f"rng seed is {rng_seed}")
 
     def get_stats(team_name: str) -> TeamStats:
         name = team_name.strip()
@@ -1429,6 +1463,23 @@ def main():
         if ts.experience == 0.0 and ts.seed > 0:
             ts.experience = SEED_EXPERIENCE.get(ts.seed, 1.0)
 
+    # Compute stud factor from player_stats (if available)
+    try:
+        player_conn = sqlite3.connect(args.db)
+        player_conn.row_factory = sqlite3.Row
+        has_player_stats = player_conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='player_stats'"
+        ).fetchone()[0] > 0
+        player_conn.close()
+        if has_player_stats:
+            for ms, ts in team_lookup.items():
+                if ts.has_data:
+                    ts.stud_factor = compute_stud_factor(args.db, ts.team)
+            stud_count = sum(1 for ts in team_lookup.values() if ts.stud_factor > 0)
+            console.print(f"[green]{stud_count} teams with stud players identified[/green]")
+    except Exception:
+        pass  # player_stats table may not exist yet
+
     # Compute z-scores across all teams in the lookup
     z_scores = compute_z_scores(team_lookup)
 
@@ -1441,22 +1492,131 @@ def main():
     # Apply injury adjustments if requested
     if args.injuries:
         try:
-            from injuries import init_db as inj_init_db, get_all_team_impacts, display_team_impacts
+            from injuries import (
+                init_db as inj_init_db, get_latest_injuries, display_team_impacts,
+            )
+            from players import (
+                get_player_stats as get_player_stats_db,
+                match_injured_to_roster, normalize_name, bracket_to_torvik,
+            )
             inj_conn = inj_init_db(args.injury_db)
-            impacts = get_all_team_impacts(inj_conn, list(team_lookup.keys()))
-            impacted_count = sum(1 for m in impacts.values() if m < 1.0)
-            if impacted_count:
-                console.print(f"[bold]Applying injury adjustments to {impacted_count} teams...[/bold]")
-                display_team_impacts(impacts, console)
-                console.print()
-                for team_name, mult in impacts.items():
-                    if mult < 1.0 and team_name in team_lookup:
-                        ts = team_lookup[team_name]
-                        ts.adj_margin *= mult
-                        ts.eff_margin *= mult
-            else:
-                console.print("[green]No bracket teams with injuries.[/green]\n")
+            all_injuries = get_latest_injuries(inj_conn)
             inj_conn.close()
+
+            if all_injuries:
+                # Group injuries by bracket team name
+                team_inj_map: dict[str, list] = {}
+                for inj in all_injuries:
+                    team_inj_map.setdefault(inj.bracket_team, []).append(inj)
+
+                player_conn = sqlite3.connect(args.db)
+                player_conn.row_factory = sqlite3.Row
+
+                impacts: dict[str, float] = {}
+                impact_details: list[tuple] = []
+
+                for bracket_name, ts in team_lookup.items():
+                    injuries = team_inj_map.get(bracket_name, [])
+                    if not injuries:
+                        impacts[bracket_name] = 1.0
+                        continue
+
+                    # Get roster from player_stats
+                    torvik_name = ts.team if ts.has_data else bracket_to_torvik(bracket_name)
+                    roster = get_player_stats_db(player_conn, torvik_name)
+
+                    # Get team's total games played (max gp on roster)
+                    team_total_gp = max((p.gp or 0 for p in roster), default=33) if roster else 33
+
+                    matched = match_injured_to_roster(
+                        [inj.player for inj in injuries], roster
+                    )
+                    inj_status = {normalize_name(inj.player): inj.status for inj in injuries}
+
+                    penalty = 0.0
+                    for inj_name, player in matched:
+                        status = inj_status.get(normalize_name(inj_name), "Out")
+                        min_pct = player.min_pct or 0
+                        bpm = player.bpm or 0
+                        gp = player.gp or 0
+
+                        # Recency factor: what fraction of games did they play?
+                        # High gp_ratio = played most of season, just got hurt → BIG impact
+                        # Low gp_ratio = been out a long time → already baked into stats
+                        gp_ratio = gp / team_total_gp if team_total_gp > 0 else 0.5
+
+                        # Contribution score: high minutes + positive BPM = more valuable
+                        contribution = (min_pct / 100) * max(bpm + 3, 0) / 6
+
+                        # Status multiplier
+                        status_mult = {"Out For Season": 1.0, "Out": 0.9, "Game Time Decision": 0.3}.get(status, 0.5)
+
+                        # Final per-player penalty:
+                        # - gp_ratio near 1.0 → new injury, full penalty
+                        # - gp_ratio near 0 → long-absent, near-zero penalty
+                        player_penalty = contribution * status_mult * gp_ratio
+                        penalty += player_penalty
+
+                        if player_penalty > 0.005:
+                            impact_details.append((
+                                bracket_name, player.player, status,
+                                min_pct, bpm, gp, team_total_gp, gp_ratio,
+                                player_penalty,
+                            ))
+
+                    MAX_INJURY_PENALTY = 0.33
+                    penalty = min(penalty, MAX_INJURY_PENALTY)
+                    impacts[bracket_name] = 1.0 - penalty
+
+                player_conn.close()
+
+                impacted_count = sum(1 for m in impacts.values() if m < 1.0)
+                if impacted_count:
+                    console.print(f"[bold]Applying injury adjustments to {impacted_count} teams...[/bold]")
+
+                    # Show detailed impact table
+                    if impact_details:
+                        inj_table = Table(
+                            title="Injury Impact (Contribution-Weighted)",
+                            show_header=True, header_style="bold red",
+                        )
+                        inj_table.add_column("Team", width=18)
+                        inj_table.add_column("Player", width=18)
+                        inj_table.add_column("Status", width=16)
+                        inj_table.add_column("Min%", justify="right", width=5)
+                        inj_table.add_column("BPM", justify="right", width=6)
+                        inj_table.add_column("GP", justify="right", width=6)
+                        inj_table.add_column("Recency", justify="right", width=7)
+                        inj_table.add_column("Penalty", justify="right", width=7)
+
+                        impact_details.sort(key=lambda x: x[8], reverse=True)
+                        for (team, player, status, min_pct, bpm, gp,
+                             total_gp, gp_ratio, pen) in impact_details:
+                            sc = {"Out For Season": "[red]", "Out": "[yellow]",
+                                  "Game Time Decision": "[green]"}.get(status, "[dim]")
+                            recency_color = "[red]" if gp_ratio > 0.8 else (
+                                "[yellow]" if gp_ratio > 0.5 else "[green]"
+                            )
+                            inj_table.add_row(
+                                team, player, f"{sc}{status}[/]",
+                                f"{min_pct:.0f}", f"{bpm:+.1f}",
+                                f"{gp}/{total_gp}",
+                                f"{recency_color}{gp_ratio:.0%}[/]",
+                                f"[red]-{pen:.1%}[/]",
+                            )
+                        console.print(inj_table)
+
+                    display_team_impacts(impacts, console)
+                    console.print()
+                    for team_name, mult in impacts.items():
+                        if mult < 1.0 and team_name in team_lookup:
+                            ts = team_lookup[team_name]
+                            ts.adj_margin *= mult
+                            ts.eff_margin *= mult
+                else:
+                    console.print("[green]No bracket teams with injuries.[/green]\n")
+            else:
+                console.print("[green]No injury data found.[/green]\n")
         except Exception as exc:
             console.print(f"[yellow]Could not load injuries: {exc}[/yellow]\n")
 
